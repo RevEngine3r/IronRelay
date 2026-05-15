@@ -1,0 +1,34 @@
+{
+  "_comment": "IronRelay client config — copy to ironrelay.json and fill in your values.",
+
+  "_comment_script_keys": "Add one entry per Apps Script deployment. The client auto-builds the full URL from the ID. Use multiple IDs (even across Google accounts) for round-robin failover.",
+  "script_keys": [
+    {"id": "REPLACE_WITH_DEPLOYMENT_ID",         "account": "acct-a"},
+    {"id": "OPTIONAL_SECOND_DEPLOYMENT_ID",       "account": "acct-a"},
+    {"id": "OPTIONAL_THIRD_DEPLOYMENT_ON_ACCT_B", "account": "acct-b"}
+  ],
+
+  "_comment_relay_url": "Alternative to script_keys: point directly at your CF Worker.",
+  "relay_url": "",
+
+  "_comment_tunnel_key": "Generate with: ironrelay -keygen   Must match the PSK on the server / CF Worker.",
+  "tunnel_key": "REPLACE_WITH_OUTPUT_OF_ironrelay_-keygen",
+
+  "_comment_socks": "Local SOCKS5 proxy address.",
+  "socks_host": "127.0.0.1",
+  "socks_port": 1080,
+
+  "_comment_fronting": "Domain fronting: dial google_host IP, present sni in TLS ClientHello.",
+  "google_host": "216.239.38.120:443",
+  "sni": ["www.google.com", "mail.google.com", "accounts.google.com"],
+
+  "_comment_socks_auth": "Optional SOCKS5 username/password (RFC 1929). Both must be set or both omitted.",
+  "socks_user": "",
+  "socks_pass": "",
+
+  "_comment_tuning": "coalesce_step_ms: 0 = off; 20-40 ms reduces Apps Script calls under burst traffic. idle_slots_per_bucket: 1 (safe default); raise to 2 if each Google account has 2+ deployments. poll_ms: default 50.",
+  "coalesce_step_ms": 0,
+  "idle_slots_per_bucket": 1,
+  "poll_ms": 50,
+  "debug_timing": false
+}
