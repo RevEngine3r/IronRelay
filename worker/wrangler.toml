@@ -1,0 +1,8 @@
+name = "ironrelay"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# Required: set via `wrangler secret put RELAY_TOKEN`
+# or add here for dev only (do not commit real secrets):
+# [vars]
+# RELAY_TOKEN = "change-me"
