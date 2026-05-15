@@ -45,16 +45,13 @@ type endpoint struct {
 }
 
 // Session holds the pipe between the SOCKS5 handler and the poll loop.
+// Methods (Close, Done, DownRx) are declared in session.go.
 type Session struct {
 	id      frame.SessionID
 	downRx  chan []byte
 	closeCh chan struct{}
 	once    sync.Once
 }
-
-func (s *Session) Close() { s.once.Do(func() { close(s.closeCh) }) }
-func (s *Session) Done() <-chan struct{}   { return s.closeCh }
-func (s *Session) DownRx() <-chan []byte  { return s.downRx }
 
 // Client is the tunnel entry point used by the SOCKS5 server.
 type Client struct {
@@ -85,9 +82,7 @@ func NewClient(relayURL, token string, pollMS int) *Client {
 		pollMS:      pollMS,
 		gsMode:      false,
 	}
-	// Legacy token-based auth (no PSK encryption)
 	if token != "" {
-		// store token in account field as a sentinel — handled in poll()
 		c.endpoints[0].account = "__token__:" + token
 	}
 	go c.pollLoop()
@@ -101,7 +96,6 @@ func NewClientFromConfig(cfg *config.Config) (*Client, error) {
 		return nil, fmt.Errorf("tunnel: %w", err)
 	}
 
-	// Build endpoint list
 	var endpoints []endpoint
 	gsMode := false
 	if len(cfg.ScriptKeys) > 0 {
@@ -119,7 +113,6 @@ func NewClientFromConfig(cfg *config.Config) (*Client, error) {
 		endpoints = []endpoint{{url: cfg.RelayURL}}
 	}
 
-	// Build HTTP clients (fronted or direct)
 	var httpClients []*http.Client
 	if cfg.GoogleHost != "" || len(cfg.SNI) > 0 {
 		fcfg := fronting.Config{
@@ -302,7 +295,6 @@ func (c *Client) nextHTTPClient() *http.Client {
 }
 
 func (c *Client) poll() {
-	// Drain up to maxFramesPerPoll outbound frames into a binary batch.
 	var raw bytes.Buffer
 	for i := 0; i < maxFramesPerPoll; i++ {
 		select {
@@ -315,16 +307,14 @@ func (c *Client) poll() {
 		}
 	}
 send:
-	ep_idx, epURL := c.pickEndpoint()
+	epIdx, epURL := c.pickEndpoint()
 	if epURL == "" {
 		return
 	}
 
-	// Build request body, optionally PSK-sealed.
 	var body []byte
 	var contentType string
 	if c.psk != nil && c.gsMode {
-		// GS path: seal and base64-encode for text/plain transit.
 		b64, err := c.psk.Seal(raw.Bytes())
 		if err != nil {
 			log.Printf("[tunnel] psk seal: %v", err)
@@ -333,7 +323,6 @@ send:
 		body = []byte(b64)
 		contentType = "text/plain"
 	} else if c.psk != nil {
-		// CF Worker path: seal as raw bytes.
 		sealed, err := c.psk.SealRaw(raw.Bytes())
 		if err != nil {
 			log.Printf("[tunnel] psk seal: %v", err)
@@ -342,7 +331,6 @@ send:
 		body = sealed
 		contentType = "application/octet-stream"
 	} else {
-		// No PSK (legacy -token mode).
 		body = raw.Bytes()
 		contentType = "application/octet-stream"
 	}
@@ -354,70 +342,65 @@ send:
 	}
 	req.Header.Set("Content-Type", contentType)
 
-	// Legacy token header (non-PSK mode).
-	if len(c.endpoints) > 0 && strings.HasPrefix(c.endpoints[ep_idx].account, "__token__:") {
-		tok := strings.TrimPrefix(c.endpoints[ep_idx].account, "__token__:")
+	if len(c.endpoints) > epIdx && strings.HasPrefix(c.endpoints[epIdx].account, "__token__:") {
+		tok := strings.TrimPrefix(c.endpoints[epIdx].account, "__token__:")
 		req.Header.Set("X-Relay-Token", tok)
 	}
 
 	resp, err := c.nextHTTPClient().Do(req)
 	if err != nil {
 		log.Printf("[tunnel] POST %s: %v", shortKey(epURL), err)
-		c.markFailure(ep_idx)
+		c.markFailure(epIdx)
 		return
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusNoContent:
-		c.markSuccess(ep_idx)
+		c.markSuccess(epIdx)
 		return
 	case http.StatusForbidden:
 		log.Printf("[tunnel] 403 from %s — wrong PSK or quota exhausted", shortKey(epURL))
-		c.markFailure(ep_idx)
+		c.markFailure(epIdx)
 		return
 	case http.StatusOK:
 		// fall through
 	default:
 		log.Printf("[tunnel] HTTP %d from %s", resp.StatusCode, shortKey(epURL))
-		c.markFailure(ep_idx)
+		c.markFailure(epIdx)
 		return
 	}
 
-	// Read and PSK-unseal the response.
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("[tunnel] read body: %v", err)
-		c.markFailure(ep_idx)
+		c.markFailure(epIdx)
 		return
 	}
 
 	var frames []byte
 	ct := resp.Header.Get("Content-Type")
 	if c.psk != nil && (strings.Contains(ct, "text/plain") || strings.Contains(ct, "text/html")) {
-		// GS relay: base64 ciphertext → open.
 		plain, err := c.psk.Open(strings.TrimSpace(string(respBody)))
 		if err != nil {
 			log.Printf("[tunnel] psk open (gs): %v", err)
-			c.markFailure(ep_idx)
+			c.markFailure(epIdx)
 			return
 		}
 		frames = plain
 	} else if c.psk != nil {
-		// CF Worker: raw ciphertext → open.
 		plain, err := c.psk.OpenRaw(respBody)
 		if err != nil {
 			log.Printf("[tunnel] psk open (cf): %v", err)
-			c.markFailure(ep_idx)
+			c.markFailure(epIdx)
 			return
 		}
 		frames = plain
 	} else {
-		// No PSK — legacy path.
 		frames = respBody
 	}
 
-	c.markSuccess(ep_idx)
+	c.markSuccess(epIdx)
 	c.decodeResponse(bytes.NewReader(frames))
 }
 
