@@ -1,27 +1,34 @@
 // Package tunnel manages the HTTP long-poll loop and per-session state.
 //
-// One shared goroutine continuously POSTs to the relay URL:
-//   - Drains pending outbound frames from all active sessions
-//   - Reads inbound ACK/FIN frames from the response body
-//   - Routes ACK payload bytes back to the correct session pipe
+// Two transport modes are supported:
+//
+//  1. Direct: plain http.Client → CF Worker (binary response body)
+//  2. Fronted: NewClientFronted() uses Google-based domain fronting.
+//     The relay (Apps Script or CF Worker) returns text/plain base64 when
+//     reached via Apps Script ContentService, so decodeResponse detects
+//     the Content-Type and base64-decodes before parsing frames.
 package tunnel
 
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RevEngine3r/IronRelay/client/frame"
+	"github.com/RevEngine3r/IronRelay/client/fronting"
 )
 
 // Session holds the pipe between the SOCKS5 handler and the poll loop.
 type Session struct {
 	id      frame.SessionID
-	downRx  chan []byte // ACK bytes from remote → SOCKS5 writer
+	downRx  chan []byte     // ACK bytes from remote → SOCKS5 writer
 	upTx    chan *frame.Frame // frames queued for next POST
 	closeCh chan struct{}
 	once    sync.Once
@@ -33,36 +40,62 @@ func (s *Session) Close() {
 
 func (s *Session) Done() <-chan struct{} { return s.closeCh }
 
+// DownRx returns the channel on which inbound ACK payloads are delivered.
+func (s *Session) DownRx() <-chan []byte { return s.downRx }
+
 // Client is the tunnel entry point used by the SOCKS5 server.
 type Client struct {
 	relayURL string
 	token    string
 	pollMS   int
-	httpC    *http.Client
+
+	// httpClients holds one client per fronted SNI (or just one for direct).
+	// Requests are distributed in round-robin via rrIdx.
+	httpClients []*http.Client
+	rrIdx       atomic.Uint64
 
 	mu       sync.Mutex
 	sessions map[frame.SessionID]*Session
 
-	// outbound is the shared queue drained by the poll loop.
-	outbound chan *frame.Frame
+	outbound chan *frame.Frame // shared queue drained by the poll loop
 }
 
-// NewClient constructs a Client and starts the background poll loop.
+// NewClient constructs a direct (non-fronted) Client.
 func NewClient(relayURL, token string, pollMS int) *Client {
+	return newClient(relayURL, token, pollMS, []*http.Client{
+		{Timeout: 30 * time.Second},
+	})
+}
+
+// NewClientFronted constructs a Client using Google-based domain fronting.
+// cfg describes the Google IP and SNI hosts; pollTimeout should comfortably
+// exceed the server's long-poll window; probeURL is the /healthz endpoint
+// used for SNI latency probing (pass "" to skip).
+func NewClientFronted(relayURL, token string, pollMS int, cfg fronting.Config, pollTimeout time.Duration, probeURL string) *Client {
+	clients := fronting.NewClients(cfg, pollTimeout, probeURL)
+	return newClient(relayURL, token, pollMS, clients)
+}
+
+func newClient(relayURL, token string, pollMS int, httpClients []*http.Client) *Client {
 	c := &Client{
-		relayURL: relayURL,
-		token:    token,
-		pollMS:   pollMS,
-		httpC:    &http.Client{Timeout: 30 * time.Second},
-		sessions: make(map[frame.SessionID]*Session),
-		outbound: make(chan *frame.Frame, 4096),
+		relayURL:    relayURL,
+		token:       token,
+		pollMS:      pollMS,
+		httpClients: httpClients,
+		sessions:    make(map[frame.SessionID]*Session),
+		outbound:    make(chan *frame.Frame, 4096),
 	}
 	go c.pollLoop()
 	return c
 }
 
+// nextHTTPClient returns clients in round-robin order.
+func (c *Client) nextHTTPClient() *http.Client {
+	idx := c.rrIdx.Add(1) - 1
+	return c.httpClients[idx%uint64(len(c.httpClients))]
+}
+
 // OpenSession allocates a new session and enqueues the SYN frame.
-// Returns the session so the caller can read ACK bytes and detect closure.
 func (c *Client) OpenSession(target string) *Session {
 	var id frame.SessionID
 	if _, err := rand.Read(id[:]); err != nil {
@@ -77,7 +110,6 @@ func (c *Client) OpenSession(target string) *Session {
 	c.mu.Lock()
 	c.sessions[id] = s
 	c.mu.Unlock()
-
 	c.outbound <- &frame.Frame{Cmd: frame.CmdSYN, SessionID: id, Payload: []byte(target)}
 	return s
 }
@@ -101,7 +133,6 @@ func (c *Client) CloseSession(s *Session) {
 	s.Close()
 }
 
-// pollLoop runs forever: sleep pollMS → drain outbound → POST → handle response.
 func (c *Client) pollLoop() {
 	ticker := time.NewTicker(time.Duration(c.pollMS) * time.Millisecond)
 	defer ticker.Stop()
@@ -113,7 +144,6 @@ func (c *Client) pollLoop() {
 const maxFramesPerPoll = 64
 
 func (c *Client) poll() {
-	// Drain up to maxFramesPerPoll outbound frames.
 	var buf bytes.Buffer
 	for i := 0; i < maxFramesPerPoll; i++ {
 		select {
@@ -126,7 +156,6 @@ func (c *Client) poll() {
 		}
 	}
 send:
-	// Always POST even if buf is empty — server may have queued ACK frames.
 	req, err := http.NewRequest(http.MethodPost, c.relayURL, &buf)
 	if err != nil {
 		log.Printf("[tunnel] build request: %v", err)
@@ -137,30 +166,50 @@ send:
 		req.Header.Set("X-Relay-Token", c.token)
 	}
 
-	resp, err := c.httpC.Do(req)
+	resp, err := c.nextHTTPClient().Do(req)
 	if err != nil {
 		log.Printf("[tunnel] POST: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNoContent {
-		return // no downstream frames
-	}
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return
+	case http.StatusOK:
+		// fall through
+	default:
 		log.Printf("[tunnel] relay returned HTTP %d", resp.StatusCode)
 		return
 	}
 
-	// Decode all frames from the response body.
-	c.decodeResponse(resp.Body)
+	// Apps Script ContentService wraps the binary batch as base64 text/plain.
+	// CF Worker responds with raw application/octet-stream.
+	// Detect by Content-Type and decode accordingly.
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "text/plain") || strings.Contains(ct, "text/html") {
+		// GS relay path: read the whole body, strip whitespace, base64-decode.
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("[tunnel] read body: %v", err)
+			return
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
+		if err != nil {
+			log.Printf("[tunnel] base64 decode: %v", err)
+			return
+		}
+		c.decodeResponse(bytes.NewReader(decoded))
+	} else {
+		// CF Worker path: stream binary body directly.
+		c.decodeResponse(resp.Body)
+	}
 }
 
 func (c *Client) decodeResponse(r io.Reader) {
 	for {
 		f, err := frame.ReadFrom(r)
 		if err != nil {
-			// EOF is normal end-of-batch; other errors are logged.
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
 				log.Printf("[tunnel] decode: %v", err)
 			}
