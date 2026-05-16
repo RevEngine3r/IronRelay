@@ -2,8 +2,8 @@
  * IronRelay — Cloudflare Worker relay server.
  *
  * Endpoints:
- *   POST /tunnel  — forward encrypted batch to VPS; PSK verified via
- *                   HMAC-SHA-256 over the raw request body.
+ *   POST /tunnel  — forward encrypted batch to VPS; body is AES-256-GCM sealed
+ *                   by the client using PSK_HEX (same key as tunnel_key).
  *   GET  /healthz — VPS health proxy
  *   GET  /info    — worker metadata
  *
@@ -40,30 +40,9 @@ export default {
 };
 
 // ---------------------------------------------------------------------------
-// PSK verification via HMAC-SHA-256
-// The client sends X-IR-HMAC: hex(HMAC-SHA256(PSK_HEX_bytes, body_bytes)).
-// We recompute and compare in constant time to prevent timing attacks.
+// AES-256-GCM helpers (matches client psk.SealRaw / psk.OpenRaw)
+// Wire format: [ 12-byte nonce | ciphertext+16-byte tag ]
 // ---------------------------------------------------------------------------
-async function importPSK(pskHex) {
-  const raw = hexToBytes(pskHex);
-  return crypto.subtle.importKey(
-    'raw', raw,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false, ['sign', 'verify']
-  );
-}
-
-async function verifyPSK(key, body, clientHmacHex) {
-  const sig = await crypto.subtle.sign('HMAC', key, body);
-  const expected = new Uint8Array(sig);
-  const actual   = hexToBytes(clientHmacHex);
-  if (expected.length !== actual.length) return false;
-  // Constant-time compare
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) diff |= expected[i] ^ actual[i];
-  return diff === 0;
-}
-
 function hexToBytes(hex) {
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < bytes.length; i++)
@@ -71,16 +50,6 @@ function hexToBytes(hex) {
   return bytes;
 }
 
-function bytesToHex(buf) {
-  return Array.from(new Uint8Array(buf))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-// ---------------------------------------------------------------------------
-// AES-256-GCM unsealing (matches client psk.SealRaw / psk.OpenRaw)
-// Wire format: [ 12-byte nonce | ciphertext+16-byte tag ]
-// ---------------------------------------------------------------------------
 async function importAES(pskHex) {
   return crypto.subtle.importKey(
     'raw', hexToBytes(pskHex),
@@ -128,25 +97,15 @@ async function handleTunnel(request, env) {
     return new Response('request too large', { status: 413 });
   }
 
-  // PSK verification via HMAC-SHA-256 header
+  // PSK mode: unseal the AES-GCM body, forward plaintext to VPS, re-seal response.
+  // Authentication is implicit: a wrong key will cause decrypt to throw.
   if (env.PSK_HEX) {
-    const clientHmac = request.headers.get('X-IR-HMAC') || '';
-    if (!clientHmac) {
-      return new Response('missing X-IR-HMAC', { status: 403 });
-    }
-    const pskKey = await importPSK(env.PSK_HEX);
-    const ok = await verifyPSK(pskKey, bodyBuf, clientHmac);
-    if (!ok) {
-      return new Response('forbidden — PSK mismatch', { status: 403 });
-    }
-
-    // Unseal the AES-GCM body to get the plaintext frame batch
     let plain;
     try {
       const aesKey = await importAES(env.PSK_HEX);
       plain = await aesOpen(aesKey, bodyBuf);
     } catch (e) {
-      return new Response('decrypt failed', { status: 403 });
+      return new Response('decrypt failed — wrong PSK or tampered body', { status: 403 });
     }
 
     // Forward plaintext to VPS, seal VPS response back to client
@@ -158,8 +117,8 @@ async function handleTunnel(request, env) {
     if (vpsBody.byteLength === 0) {
       return new Response(null, { status: 204 });
     }
-    const aesKey = await importAES(env.PSK_HEX);
-    const sealed = await aesSeal(aesKey, vpsBody);
+    const sealKey = await importAES(env.PSK_HEX);
+    const sealed  = await aesSeal(sealKey, vpsBody);
     return new Response(sealed, {
       status: 200,
       headers: { 'Content-Type': 'application/octet-stream' },

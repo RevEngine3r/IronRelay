@@ -46,7 +46,10 @@ func (s *Server) ListenAndServe() error {
 
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		log.Printf("[socks5] set deadline: %v", err)
+		return
+	}
 
 	target, err := handshake(conn)
 	if err != nil {
@@ -55,13 +58,19 @@ func (s *Server) handle(conn net.Conn) {
 	}
 
 	// Remove the deadline — data transfer may take arbitrary time.
-	conn.SetDeadline(time.Time{})
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		log.Printf("[socks5] clear deadline: %v", err)
+		return
+	}
 
 	sess := s.client.OpenSession(target)
 	defer s.client.CloseSession(sess)
 
 	// Reply success: BND.ADDR = 0.0.0.0, BND.PORT = 0
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		log.Printf("[socks5] write reply: %v", err)
+		return
+	}
 
 	// upstream: local conn → tunnel
 	go func() {
@@ -102,9 +111,13 @@ func handshake(conn net.Conn) (string, error) {
 	}
 	nMethods := int(header[1])
 	methods := make([]byte, nMethods)
-	io.ReadFull(conn, methods)
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return "", fmt.Errorf("read methods: %w", err)
+	}
 	// No auth
-	conn.Write([]byte{0x05, 0x00})
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return "", fmt.Errorf("write method select: %w", err)
+	}
 
 	// Request
 	req := make([]byte, 4)
@@ -112,7 +125,7 @@ func handshake(conn net.Conn) (string, error) {
 		return "", err
 	}
 	if req[1] != 0x01 {
-		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return "", fmt.Errorf("only CONNECT supported (cmd=0x%02x)", req[1])
 	}
 
@@ -120,24 +133,34 @@ func handshake(conn net.Conn) (string, error) {
 	switch req[3] {
 	case 0x01: // IPv4
 		ipv4 := make([]byte, 4)
-		io.ReadFull(conn, ipv4)
+		if _, err := io.ReadFull(conn, ipv4); err != nil {
+			return "", fmt.Errorf("read ipv4: %w", err)
+		}
 		host = net.IP(ipv4).String()
 	case 0x03: // domain
 		lenB := make([]byte, 1)
-		io.ReadFull(conn, lenB)
+		if _, err := io.ReadFull(conn, lenB); err != nil {
+			return "", fmt.Errorf("read domain len: %w", err)
+		}
 		name := make([]byte, lenB[0])
-		io.ReadFull(conn, name)
+		if _, err := io.ReadFull(conn, name); err != nil {
+			return "", fmt.Errorf("read domain: %w", err)
+		}
 		host = string(name)
 	case 0x04: // IPv6
 		ipv6 := make([]byte, 16)
-		io.ReadFull(conn, ipv6)
+		if _, err := io.ReadFull(conn, ipv6); err != nil {
+			return "", fmt.Errorf("read ipv6: %w", err)
+		}
 		host = "[" + net.IP(ipv6).String() + "]"
 	default:
 		return "", fmt.Errorf("unsupported addr type 0x%02x", req[3])
 	}
 
 	portB := make([]byte, 2)
-	io.ReadFull(conn, portB)
+	if _, err := io.ReadFull(conn, portB); err != nil {
+		return "", fmt.Errorf("read port: %w", err)
+	}
 	port := binary.BigEndian.Uint16(portB)
 
 	return fmt.Sprintf("%s:%d", host, port), nil
