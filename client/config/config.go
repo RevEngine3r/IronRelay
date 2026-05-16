@@ -4,8 +4,8 @@
 package config
 
 import (
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -41,10 +41,10 @@ type Config struct {
 	SocksPass string `json:"socks_pass"`
 
 	// Tuning
-	CoalesceStepMS   int  `json:"coalesce_step_ms"`   // 0 = disabled
+	CoalesceStepMS    int  `json:"coalesce_step_ms"`    // 0 = disabled
 	IdleSlotsPerBucket int `json:"idle_slots_per_bucket"` // default 1, max 3
-	DebugTiming      bool `json:"debug_timing"`
-	PollMS           int  `json:"poll_ms"`             // default 50
+	DebugTiming        bool `json:"debug_timing"`
+	PollMS             int  `json:"poll_ms"`              // default 50
 }
 
 // Load reads and validates the config file at path.

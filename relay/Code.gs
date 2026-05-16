@@ -5,7 +5,7 @@
  *  1. Open Project Settings → Script Properties
  *  2. Add:
  *       CF_WORKER_URL  =  https://ironrelay.<your-subdomain>.workers.dev/tunnel
- *       RELAY_TOKEN    =  (same secret configured in CF Worker env)
+ *       RELAY_TOKEN    =  (same secret configured in CF Worker env as SHARED_SECRET)
  *  3. Deploy → Web app → Execute as: Me → Who has access: Anyone
  *  4. Copy the /exec URL → use as -relay flag in the Go client
  *
@@ -23,7 +23,8 @@ function doPost(e) {
     method: 'post',
     payload: body,
     contentType: 'application/octet-stream',
-    headers: { 'X-Relay-Token': RELAY_TOKEN },
+    // Header name matches what the CF Worker checks: X-Relay-Auth
+    headers: { 'X-Relay-Auth': RELAY_TOKEN },
     muteHttpExceptions: true,
   };
 
